@@ -8,18 +8,9 @@ from dimos.robot.manipulators.a1z.blueprints.basic import (
 from dimos.robot.manipulators.a1z.config import make_a1z_model_config
 from dimos.robot.manipulators.common.blueprints import planner
 
-# Existing DimOS default only.
-# Replace with your measured custom home.
-# Radians, ordered arm_joint1 through arm_joint6.
-
-_HOME_JOINTS_RAD: list[float] = [
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-]
+# Planner home for arm_joint1 through arm_joint6, in radians.
+# The A1Z jaw center is level, about 0.35 m forward and 0.40 m up from base_link.
+_HOME_JOINTS_RAD: list[float] = [0.0, 1.23, -1.13, -0.10, 0.0, 0.0]
 
 galaxea_a1z_localize = autoconnect(
     a1z_coordinator(),
