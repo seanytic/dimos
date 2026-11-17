@@ -75,6 +75,7 @@ all_blueprints = {
     "dual-openyam-planner-coordinator": "dimos.robot.manipulators.dual_openyam.blueprints.basic:dual_openyam_planner_coordinator",
     "dual-openyam-quest-collection": "dimos.robot.manipulators.dual_openyam.blueprints.learning_collection:dual_openyam_quest_collection",
     "dual-xarm6-planner-coordinator": "dimos.robot.manipulators.xarm.blueprints.basic:dual_xarm6_planner_coordinator",
+    "galaxea-a1z-localize": "dimos.robot.manipulators.a1z.blueprints.galaxea_a1z_localize:galaxea_a1z_localize",
     "go2-dds": "dimos.robot.unitree.go2.dds.blueprints:go2_dds",
     "go2-dds-mid360": "dimos.robot.unitree.go2.dds.blueprints:go2_dds_mid360",
     "go2-localize": "dimos.robot.unitree.go2.blueprints.smart.go2_localize:go2_localize",
