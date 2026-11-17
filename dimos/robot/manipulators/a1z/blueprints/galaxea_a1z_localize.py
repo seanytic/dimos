@@ -10,7 +10,7 @@ from dimos.robot.manipulators.common.blueprints import planner
 
 # Planner home for arm_joint1 through arm_joint6, in radians.
 # The A1Z jaw center is level, about 0.35 m forward and 0.40 m up from base_link.
-_HOME_JOINTS_RAD: list[float] = [0.0, 1.23, -1.13, -0.10, 0.0, 0.0]
+_HOME_JOINTS_RAD: list[float] = [0.0, 1.23, -1.13, 0.6854, 0.0, 0.0]
 
 galaxea_a1z_localize = autoconnect(
     a1z_coordinator(),
