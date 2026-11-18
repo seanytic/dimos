@@ -243,6 +243,8 @@ class FrameTargetSnapshot:
     targets: Mapping[str, PoseStamped]
     last_update_time: float
     extra_joint_positions: Mapping[str, float] = field(default_factory=dict)
+    # Optional joint jog: bypass IK, retaining the same streaming limits and holds.
+    joint_velocities: Mapping[str, float] | None = None
 
 
 @dataclass
@@ -288,8 +290,14 @@ class PinkPoseTargetSolver(_PinkSolverCore):
         frame_targets: Mapping[str, PoseStamped],
         measured_state: JointState,
         dt: float,
+        *,
+        joint_velocities: Mapping[str, float] | None = None,
     ) -> JointState | None:
-        """Advance the persistent command trajectory by one bounded QP step."""
+        """Advance the bounded trajectory using IK, or a direct joint jog.
+
+        Joint jogs skip IK; unspecified joints hold their commanded positions.
+        Reset before switching modes to discard the previous motion's filter history.
+        """
         with self._command_state_lock:
             command_state = JointState(self._command_state or measured_state)
             command_increment_history = tuple(
@@ -312,6 +320,7 @@ class PinkPoseTargetSolver(_PinkSolverCore):
             joint_velocity_limits_rad_s=self._control_config.joint_velocity_limits_rad_s,
             joint_command_filter_cutoff_hz=self._control_config.joint_command_filter_cutoff_hz,
             command_increment_history=command_increment_history,
+            joint_velocities=joint_velocities,
         )
         with self._command_state_lock:
             if self._command_state_generation != generation:
@@ -355,6 +364,7 @@ class PinkPoseTargetSolver(_PinkSolverCore):
         joint_velocity_limits_rad_s: Mapping[str, float] | None = None,
         joint_command_filter_cutoff_hz: float | None = None,
         command_increment_history: Sequence[NDArray[np.float64]] = (),
+        joint_velocities: Mapping[str, float] | None = None,
     ) -> _StreamingStepResult:
         """Perform one feedback-bounded Pink update for the control loop."""
         if not frame_targets:
@@ -390,26 +400,34 @@ class PinkPoseTargetSolver(_PinkSolverCore):
         raw_command_q = self._q_from_dimos_positions(robot_context, previous_positions)
         measured_q = self._q_from_dimos_positions(robot_context, measured_positions)
         self._validate_streaming_feedback(robot_context, measured_q, feedback_limit_tolerance)
-        command_q = self._clamp_streaming_configuration(
-            robot_context, raw_command_q, command_limit_margin
-        )
-        configuration = pink.Configuration(
-            robot_context.model,
-            robot_context.data,
-            command_q.copy(),
-        )
-        if control_context.tasks is None:
-            control_context.tasks = self._build_task_stack(configuration, frame_names)
-        tasks = control_context.tasks
-        self._update_frame_task_targets(tasks, targets)
-        self._update_current_posture_target(tasks, configuration)
-        self._step_configuration(
-            configuration=configuration,
-            tasks=tasks,
-            dt=step_dt,
-        )
-        candidate_positions = self._q_to_dimos_positions(robot_context, configuration.q)
-        if joint_command_filter_cutoff_hz is not None:
+        if joint_velocities is None:
+            command_q = self._clamp_streaming_configuration(
+                robot_context, raw_command_q, command_limit_margin
+            )
+            configuration = pink.Configuration(
+                robot_context.model,
+                robot_context.data,
+                command_q.copy(),
+            )
+            if control_context.tasks is None:
+                control_context.tasks = self._build_task_stack(configuration, frame_names)
+            tasks = control_context.tasks
+            self._update_frame_task_targets(tasks, targets)
+            self._update_current_posture_target(tasks, configuration)
+            self._step_configuration(
+                configuration=configuration,
+                tasks=tasks,
+                dt=step_dt,
+            )
+            candidate_positions = self._q_to_dimos_positions(robot_context, configuration.q)
+        else:
+            if set(joint_velocities) - set(joint_names) or not all(
+                math.isfinite(value) for value in joint_velocities.values()
+            ):
+                raise ValueError("Joint jog requires known joints and finite velocities")
+            velocities = np.array([joint_velocities.get(name, 0.0) for name in joint_names])
+            candidate_positions = previous_positions + velocities * step_dt
+        if joint_velocities is None and joint_command_filter_cutoff_hz is not None:
             alpha = -np.expm1(-2.0 * np.pi * joint_command_filter_cutoff_hz * step_dt)
             candidate_positions = previous_positions + alpha * (
                 candidate_positions - previous_positions
@@ -703,7 +721,15 @@ class PoseTargetIKTask(BaseControlTask):
             self._reset_command_state()
             return None
         try:
-            result = self._solver.step(snapshot.targets, measured_state, state.dt)
+            if snapshot.joint_velocities is None:
+                result = self._solver.step(snapshot.targets, measured_state, state.dt)
+            else:
+                result = self._solver.step(
+                    snapshot.targets,
+                    measured_state,
+                    state.dt,
+                    joint_velocities=snapshot.joint_velocities,
+                )
         except PinkJointLimitError as exc:
             warning_key = (exc.joint_name, exc.boundary)
             last_warning = self._feedback_limit_warning_times.get(warning_key)

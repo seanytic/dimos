@@ -315,9 +315,10 @@ class JointTrajectoryTask(BaseControlTask):
             final_position = run.trajectory.points[-1].positions[index]
             nominal_complete = elapsed >= run.trajectory.duration
             reached = math.isclose(commanded, final_position, abs_tol=1e-9)
-            if nominal_complete and reached:
+            # A guarded jog keeps its deadline so release can hold the motor's
+            # measured angle even after we have sent the final setpoint.
+            if deadline is None and nominal_complete and reached:
                 del self._motions[joint_name]
-                self._stream_deadlines.pop(joint_name, None)
             else:
                 all_complete = False
 

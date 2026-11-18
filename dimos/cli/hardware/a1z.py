@@ -336,6 +336,17 @@ def doctor(
     typer.echo("A1Z doctor passed.")
 
 
+@app.command()
+def spacemouse() -> None:
+    """Translate, pitch, open, and close the running A1Z gripper with a SpaceMouse."""
+    try:
+        importlib.import_module("dimos.cli.hardware.a1z_spacemouse").run()
+    except KeyError as exc:
+        _abort(f"Missing {exc}. Start galaxea-a1z-localize before attaching the SpaceMouse.")
+    except (RuntimeError, OSError) as exc:
+        _abort(str(exc))
+
+
 @app.command("configure-can")
 def configure_can(
     interface: str = typer.Option(

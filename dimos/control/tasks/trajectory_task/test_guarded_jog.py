@@ -27,20 +27,21 @@ def task() -> JointTrajectoryTask:
     return JointTrajectoryTask(JointTrajectoryTaskConfig(joint_names=["arm/a", "arm/b"]))
 
 
-def state(now: float) -> CoordinatorState:
+def state(now: float, position: float = 0.1) -> CoordinatorState:
     return CoordinatorState(
-        joints=JointStateSnapshot(joint_positions={"arm/a": 0.1, "arm/b": 0.2}),
+        joints=JointStateSnapshot(joint_positions={"arm/a": position, "arm/b": 0.2}),
         t_now=now,
         dt=0.01,
     )
 
 
 @pytest.mark.parametrize("explicit_stop", [False, True])
+@pytest.mark.parametrize("target", [0.105, 1.0], ids=["setpoint-reached", "still-ramping"])
 def test_guarded_jog_holds_measured_position_on_expiry_or_stop(
-    task: JointTrajectoryTask, explicit_stop: bool
+    task: JointTrajectoryTask, explicit_stop: bool, target: float
 ) -> None:
     assert task.on_joint_command(
-        JointState(frame_id="dimos/guarded-joint", name=["arm/a"], position=[1.0]), 1.0
+        JointState(frame_id="dimos/guarded-joint", name=["arm/a"], position=[target]), 1.0
     )
     moving = task.compute(state(1.1))
     assert moving is not None and moving.positions[0] > 0.1
@@ -48,10 +49,11 @@ def test_guarded_jog_holds_measured_position_on_expiry_or_stop(
         assert task.on_joint_command(
             JointState(frame_id="dimos/guarded-joint", name=["arm/a"], velocity=[0.0]), 1.2
         )
-    stopped = task.compute(state(1.2 if explicit_stop else 1.4))
+    # The motor has only moved part of the way when the cap is released or times out.
+    stopped = task.compute(state(1.2 if explicit_stop else 1.4, position=0.102))
     assert stopped is not None
     assert stopped.joint_names == ["arm/a"]
-    assert stopped.positions == [0.1]
+    assert stopped.positions == [0.102]
     assert not task.is_active()
     assert task.compute(state(2.0)) is None
 

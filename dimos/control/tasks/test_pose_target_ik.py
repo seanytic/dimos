@@ -16,6 +16,7 @@
 
 from pathlib import Path
 
+import attrs
 import numpy as np
 import pytest
 from pytest_mock import MockerFixture
@@ -218,6 +219,114 @@ def test_pose_target_solver_reset_during_step_discards_command_and_filter_histor
     assert result is None
     assert solver._command_state is None
     assert tuple(solver._command_increment_history) == ()
+
+
+@pytest.fixture
+def joint_jog_config(tmp_path):
+    model_path = tmp_path / "two_joints.urdf"
+    model_path.write_text(
+        """<robot name="two_joints">
+          <link name="base_link"/><link name="arm"/><link name="tool"/>
+          <joint name="a" type="revolute">
+            <parent link="base_link"/><child link="arm"/><axis xyz="0 0 1"/>
+            <limit lower="-1" upper="1" effort="1" velocity="0.3"/>
+          </joint>
+          <joint name="b" type="revolute">
+            <parent link="arm"/><child link="tool"/><axis xyz="0 1 0"/>
+            <origin xyz="0.3 0 0"/>
+            <limit lower="-1" upper="1" effort="1" velocity="1"/>
+          </joint>
+        </robot>"""
+    )
+    return PoseTargetIKTaskConfig(
+        joint_names=("a", "b"),
+        robot_model=RobotModelConfig(
+            model=RobotModel.from_file(model_path).with_default_joint_acceleration_limit(2.0),
+            joint_names=["a", "b"],
+        ),
+        target_frames=("tool",),
+        max_joint_velocity_rad_s=0.2,
+    )
+
+
+def test_joint_jog_integrates_only_selected_joint_and_resets_to_hold(joint_jog_config):
+    solver = PinkPoseTargetSolver(joint_jog_config)
+    measured = JointState(name=["a", "b"], position=[0.0, 0.25])
+    targets = solver.frame_poses(measured, ["tool"])
+
+    for tick in range(1, 11):
+        command = solver.step(targets, measured, 0.01, joint_velocities={"a": 0.1})
+        assert command is not None
+        assert command.position[0] == pytest.approx(tick * 0.001)
+        assert command.position[1] == 0.25
+
+    solver.reset()
+    held = solver.step(targets, measured, 0.01, joint_velocities={})
+    assert held is not None
+    assert held.position == measured.position
+
+
+@pytest.mark.parametrize(
+    ("global_limit", "joint_limits", "expected_velocity"),
+    [(0.2, {}, 0.2), (1.0, {}, 0.3), (0.2, {"a": 0.07}, 0.07)],
+)
+def test_joint_jog_obeys_configured_and_model_velocity_limits(
+    joint_jog_config, global_limit, joint_limits, expected_velocity
+):
+    solver = PinkPoseTargetSolver(
+        attrs.evolve(
+            joint_jog_config,
+            max_joint_velocity_rad_s=global_limit,
+            joint_velocity_limits_rad_s=joint_limits,
+        )
+    )
+    measured = JointState(name=["a", "b"], position=[0.0, 0.25])
+    targets = solver.frame_poses(measured, ["tool"])
+
+    command = solver.step(targets, measured, 0.01, joint_velocities={"a": 10.0})
+
+    assert command is not None
+    assert command.position == pytest.approx([expected_velocity * 0.01, 0.25])
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_joint_jog_stops_at_model_position_limit(joint_jog_config, direction):
+    solver = PinkPoseTargetSolver(joint_jog_config)
+    measured = JointState(name=["a", "b"], position=[direction * 0.999, 0.25])
+    targets = solver.frame_poses(measured, ["tool"])
+    limit = 1.0 - joint_jog_config.command_limit_margin
+
+    for _ in range(5):
+        command = solver.step(targets, measured, 0.01, joint_velocities={"a": direction * 0.1})
+        assert command is not None
+        assert command.position[0] == pytest.approx(direction * limit)
+        assert command.position[1] == 0.25
+        measured = command
+
+
+def test_joint_jog_cannot_run_ahead_of_stalled_feedback(joint_jog_config):
+    solver = PinkPoseTargetSolver(
+        attrs.evolve(joint_jog_config, max_command_tracking_error_deg=float(np.rad2deg(0.005)))
+    )
+    measured = JointState(name=["a", "b"], position=[0.0, 0.25])
+    targets = solver.frame_poses(measured, ["tool"])
+
+    for _ in range(30):
+        command = solver.step(targets, measured, 0.01, joint_velocities={"a": 0.1})
+        assert command is not None
+        assert command.position[0] <= 0.005 + 1e-12
+        assert command.position[1] == 0.25
+    assert command.position[0] == pytest.approx(0.005)
+
+
+@pytest.mark.parametrize("velocities", [{"missing": 0.1}, {"a": np.nan}, {"a": np.inf}])
+def test_joint_jog_rejects_unknown_joints_and_nonfinite_velocities(joint_jog_config, velocities):
+    solver = PinkPoseTargetSolver(joint_jog_config)
+    measured = JointState(name=["a", "b"], position=[0.0, 0.25])
+    targets = solver.frame_poses(measured, ["tool"])
+
+    with pytest.raises(ValueError, match="known joints and finite velocities"):
+        solver.step(targets, measured, 0.01, joint_velocities=velocities)
 
 
 @pytest.mark.parametrize(

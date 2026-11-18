@@ -111,6 +111,62 @@ After starting, and before its motors turn off on stop, it moves to its home:
 all joints at 0 rad, folded at rest. Set `--a1zconnection.home '[...]'` (six
 angles in rad) for another pose.
 
+### SpaceMouse control
+
+Install the optional Python driver with `uv sync --extra spacemouse --inexact`. On macOS,
+install `hidapi` with `brew install hidapi`. On Linux, install `libhidapi-hidraw0` and give
+your user access to the SpaceMouse HID device.
+
+Plug the SpaceMouse into the computer running DimOS and launch the A1Z with its input module:
+
+```bash
+dimos run galaxea-a1z-spacemouse --a1zconnection.can-port a1zcan
+```
+
+`SpaceMouseTeleopModule` publishes `ee_twist_command` (arm motion) and
+`gripper_command` (normalized opening). The A1Z coordinator consumes those streams.
+If `galaxea-a1z-localize` is already running, you can attach a SpaceMouse from the
+operator's computer with `dimos hardware a1z spacemouse` in a second terminal.
+
+SpaceMouse control starts **disabled**, including the gripper buttons. In the
+terminal running the SpaceMouse, tap **s** to toggle control on or off. No Enter is
+needed. Disabling sends a stop; enabling accepts the current mouse input immediately.
+The terminal prints the enabled/disabled state. Tap the key rather than holding it,
+since keyboard repeat can toggle it again.
+This terminal toggle belongs to the SpaceMouse module and also works in the
+attachment command. Run it in the foreground; for a background robot stack, use
+`galaxea-a1z-localize --daemon` and the separate foreground attachment command.
+The toggle gates SpaceMouse input only; it does not disable other robot commands.
+
+| SpaceMouse Compact input | Gripper action |
+| --- | --- |
+| Push the cap away / pull it toward you | Move forward / backward |
+| Slide the cap left / right | Rotate only the base joint left / right |
+| Lift / press the cap | Move up / down |
+| Twist right (clockwise from above) / left | Nod up / down using only joint 4 |
+| Left button / right button | Open / close |
+
+The strongest cap motion selects one axis at a time, including twist. Deflection
+past the 20% dead zone commands a steady 5 cm/s of translation, 10°/s of base
+rotation, or 15°/s of wrist rotation.
+Another axis must be clearly stronger to switch directions. This keeps small
+incidental cap movements from adding a second motion.
+
+Forward/backward and up/down follow straight lines along the arm base axes.
+Sideways input rotates joint 1 directly; joints 2–6 hold their angles, so the tip
+follows an arc and the jaws turn with the base. The A1Z task's `base_rotation_joint`
+setting routes pure `angular.z` commands to joint 1. The `pitch_rotation_joint`
+setting routes pure `angular.y` commands to joint 4: right twist decreases its angle
+to nod up, and left twist increases it to nod down. Every other joint holds its angle,
+so the gripper tip moves in an arc around the wrist. Both rotations bypass IK and
+reuse the controller's speed, joint-limit, and tracking-error bounds. SpaceMouse
+input no longer needs gripper-pose feedback. The arm controller smooths joint motion.
+Centering the cap sends a stop. Button presses also work while moving.
+The fully folded startup pose has little room to move backward or down. To start
+from the working home pose, run `dimos mcp call go_home` with the cap centered.
+This manual control bypasses collision planning. Ctrl-C in the blueprint terminal
+stops the whole stack. Ctrl-C in the separate attachment command ends only its input.
+
 ## Troubleshooting
 
 - **The interface is UP, but the arm does not respond.** Some Linux `gs_usb`

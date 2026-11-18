@@ -21,6 +21,7 @@ from dimos.control.tasks.trajectory_task.trajectory_task import joint_trajectory
 from dimos.core.coordination.blueprints import MetaBlueprint, autoconnect
 from dimos.core.module import ModuleBase
 from dimos.core.stream import In, Out
+from dimos.msgs.geometry_msgs.TwistStamped import TwistStamped
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.robot.manipulators._modeling import joint_names
 from dimos.robot.manipulators.a1z.config import (
@@ -36,6 +37,8 @@ class A1ZCoordinator(ControlCoordinator):
     """Joint targets out to one A1Z named "arm", and its joints in, through
     ``A1ZConnection``."""
 
+    dedicated_worker = True  # Keep the 100 Hz command loop independent of planning and input.
+    ee_twist_command: In[TwistStamped]
     arm_position_command: Out[JointState]
     arm_joint_state: In[JointState]
 
@@ -47,7 +50,7 @@ A1Z_REMAPS: list[tuple[type[ModuleBase], str, str]] = [
 ]
 
 
-def a1z_coordinator() -> MetaBlueprint:
+def a1z_coordinator(*extra_tasks: TaskConfig) -> MetaBlueprint:
     """Run planned joint trajectories on an A1Z and open and close its gripper,
     through ``A1ZConnection``.
 
@@ -64,6 +67,7 @@ def a1z_coordinator() -> MetaBlueprint:
             connections=[a1z_coordinator_connection()],
             tasks=[
                 joint_trajectory_task(joint_names(A1Z_DOF, prefix="arm/arm_joint")),
+                *extra_tasks,
                 # arm/gripper is open at its upper end, the task's default.
                 TaskConfig(
                     name="arm_gripper",

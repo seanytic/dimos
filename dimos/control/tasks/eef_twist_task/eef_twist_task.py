@@ -51,6 +51,9 @@ class EEFTwistTaskConfig(PoseTargetIKTaskConfig):
 
     Attributes:
         target_frames: The one robot frame (link name) the twists move.
+        base_rotation_joint: Optional base joint driven directly by pure angular.z
+            commands. Other twists use Cartesian IK as usual.
+        pitch_rotation_joint: Optional wrist joint driven directly by pure angular.y.
         command_timeout: Seconds after the last non-zero twist before the
             task stops the arm and releases its joints to other tasks.
             0 means it never releases them: with no twist coming in it keeps
@@ -63,6 +66,8 @@ class EEFTwistTaskConfig(PoseTargetIKTaskConfig):
         validator=[attrs.validators.min_len(1), attrs.validators.max_len(1)],
     )
     command_timeout: float = attrs.field(default=0.3, converter=float)
+    base_rotation_joint: str | None = None
+    pitch_rotation_joint: str | None = None
 
 
 class EEFTwistTask(PoseTargetIKTask):
@@ -95,10 +100,17 @@ class EEFTwistTask(PoseTargetIKTask):
         self._latest_twist: TwistStamped | None = None
         self._last_twist_time = 0.0
         self._target_pose: PoseStamped | None = None
+        self._joint_jog: tuple[str, int] | None = None
         self._estopped = False
         # True while no twist is being followed; only ever True with command_timeout > 0.
         self._idle = config.command_timeout > 0.0
         super().__init__(name, config, solver=solver)
+        for field, joint in (
+            ("base_rotation_joint", config.base_rotation_joint),
+            ("pitch_rotation_joint", config.pitch_rotation_joint),
+        ):
+            if joint is not None and joint not in config.joint_names:
+                raise ValueError(f"{field} must be one of the controlled joints")
 
     def is_active(self) -> bool:
         """False while e-stopped or idle; the coordinator then skips the task."""
@@ -118,7 +130,8 @@ class EEFTwistTask(PoseTargetIKTask):
 
         Args:
             twist: Linear velocity in m/s and angular velocity in rad/s.
-                All zeros stops the arm.
+                Configured pure angular.y/z commands jog the wrist/base joint
+                directly. All zeros stops the arm.
             t_now: Coordinator time in seconds (``time.perf_counter()``).
 
         Returns:
@@ -138,11 +151,24 @@ class EEFTwistTask(PoseTargetIKTask):
                     self._target_pose = None
                     self._reset_command_state()
                 return True
-            if self._idle:
+            joint_jog = None
+            # Twist order is linear xyz, angular xyz. Only pure pitch/yaw jog a joint.
+            for axis, joint in (
+                (4, self._config.pitch_rotation_joint),
+                (5, self._config.base_rotation_joint),
+            ):
+                if (
+                    joint is not None
+                    and values[axis] != 0.0
+                    and np.allclose(np.delete(values, axis), 0.0)
+                ):
+                    joint_jog = (joint, axis)
+            if self._idle or joint_jog != self._joint_jog:
                 # Start from where the arm is now; another task may have moved it.
                 self._idle = False
                 self._target_pose = None
                 self._reset_command_state()
+            self._joint_jog = joint_jog
             self._latest_twist = twist
             self._last_twist_time = t_now
         return True
@@ -179,8 +205,11 @@ class EEFTwistTask(PoseTargetIKTask):
                 # Command the stopped target this tick, release the joints from the next.
                 self._latest_twist = None
                 self._idle = True
+                if self._joint_jog is not None:
+                    self._reset_command_state()
             twist = self._latest_twist
             target = self._target_pose
+            joint_jog = self._joint_jog
 
         if target is None:
             poses = self.current_frame_poses(state, self._config.target_frames)
@@ -188,7 +217,13 @@ class EEFTwistTask(PoseTargetIKTask):
                 return None
             target = poses[self._config.target_frames[0]]
 
-        if twist is not None:
+        joint_velocities = None
+        if joint_jog is not None:
+            # Hold every other joint; the shared controller still applies its limits.
+            joint, axis = joint_jog
+            rate = float(twist_to_numpy(twist)[axis]) if twist is not None else 0.0
+            joint_velocities = {joint: rate}
+        elif twist is not None:
             target = _integrate_twist(target, twist, max(state.dt, 0.0))
 
         with self._input_lock:
@@ -200,6 +235,7 @@ class EEFTwistTask(PoseTargetIKTask):
         return FrameTargetSnapshot(
             targets={self._config.target_frames[0]: target},
             last_update_time=state.t_now,
+            joint_velocities=joint_velocities,
         )
 
     def _on_target_timeout(self) -> None:
@@ -216,6 +252,8 @@ class EEFTwistTaskParams(PoseTargetIKTaskParams):
 
     target_frame: str
     timeout: float = 0.3
+    base_rotation_joint: str | None = None
+    pitch_rotation_joint: str | None = None
 
 
 def create_task(
@@ -234,6 +272,8 @@ def create_task(
             priority=cfg.priority,
             timeout=0.0,
             command_timeout=params.timeout,
+            base_rotation_joint=params.base_rotation_joint,
+            pitch_rotation_joint=params.pitch_rotation_joint,
             max_joint_velocity_rad_s=params.max_joint_velocity_rad_s,
             joint_velocity_limits_rad_s=params.joint_velocity_limits_rad_s,
             joint_command_filter_cutoff_hz=params.joint_command_filter_cutoff_hz,

@@ -17,11 +17,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 from pytest_mock import MockerFixture
+from scipy.spatial.transform import Rotation
 
 from dimos.control.task import CoordinatorState, JointStateSnapshot
 from dimos.control.tasks.eef_twist_task.eef_twist_task import (
     EEFTwistTask,
     EEFTwistTaskConfig,
+    create_task,
 )
 from dimos.control.tasks.pose_target_ik import PinkPoseTargetSolver
 from dimos.manipulation.planning.spec.config import RobotModelConfig
@@ -29,6 +31,7 @@ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.TwistStamped import TwistStamped
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.robot.assets.model import RobotModel
+from dimos.robot.manipulators.common.blueprints import eef_twist_task
 
 
 def _robot_model() -> RobotModelConfig:
@@ -54,6 +57,8 @@ def _config(
     *,
     target_frames: tuple[str, ...] = ("tool",),
     command_timeout: float = 0.3,
+    base_rotation_joint: str | None = None,
+    pitch_rotation_joint: str | None = None,
 ) -> EEFTwistTaskConfig:
     return EEFTwistTaskConfig(
         joint_names=("arm/joint1", "arm/joint2"),
@@ -61,16 +66,26 @@ def _config(
         target_frames=target_frames,
         timeout=0.0,
         command_timeout=command_timeout,
+        base_rotation_joint=base_rotation_joint,
+        pitch_rotation_joint=pitch_rotation_joint,
     )
 
 
 def _task(
-    mocker: MockerFixture, *, command_timeout: float = 0.3
+    mocker: MockerFixture,
+    *,
+    command_timeout: float = 0.3,
+    base_rotation_joint: str | None = None,
+    pitch_rotation_joint: str | None = None,
 ) -> tuple[EEFTwistTask, PinkPoseTargetSolver]:
     solver = _solver(mocker)
     task = EEFTwistTask(
         "eef",
-        _config(command_timeout=command_timeout),
+        _config(
+            command_timeout=command_timeout,
+            base_rotation_joint=base_rotation_joint,
+            pitch_rotation_joint=pitch_rotation_joint,
+        ),
         solver=solver,
     )
     return task, solver
@@ -238,3 +253,195 @@ def test_invalid_twist_is_rejected(mocker: MockerFixture) -> None:
     invalid.linear.x = np.nan
 
     assert not task.on_ee_twist_command(invalid, t_now=1.0)
+
+
+@pytest.mark.parametrize("rate", [-0.2, 0.2])
+@pytest.mark.parametrize(
+    "field,joint,axis",
+    [("base_rotation_joint", "arm/joint1", 2), ("pitch_rotation_joint", "arm/joint2", 1)],
+)
+def test_rotation_passes_only_selected_joint_velocity_to_shared_controller(
+    mocker: MockerFixture, rate: float, field: str, joint: str, axis: int
+) -> None:
+    solver = _solver(mocker)
+    pose = PoseStamped(position=[0.3, 0, 0.2], orientation=Rotation.from_euler("y", 0.7).as_quat())
+    solver.frame_poses.return_value = {"tool": pose}
+    mocker.patch("dimos.control.tasks.pose_target_ik.PinkPoseTargetSolver", return_value=solver)
+    task = create_task(
+        eef_twist_task(robot_model=_robot_model(), target_frame="tool", **{field: joint}),
+        {},
+    )
+    angular = [0.0, 0.0, 0.0]
+    angular[axis] = rate
+    task.on_ee_twist_command(TwistStamped(angular=angular), t_now=1.0)
+
+    assert task.compute(_state(1.1, dt=0.1)) is not None
+    assert task.compute(_state(1.2, dt=0.1)) is not None
+
+    target = solver.step.call_args.args[0]["tool"]
+    assert target.position.to_numpy() == pytest.approx(pose.position.to_numpy())
+    assert target.orientation.to_rotation_matrix() == pytest.approx(
+        pose.orientation.to_rotation_matrix()
+    )
+    for call in solver.step.call_args_list:
+        assert call.kwargs["joint_velocities"] == {joint: rate}
+    assert task.claim().joints == frozenset({"arm/joint1", "arm/joint2"})
+
+
+@pytest.mark.parametrize("angular,axis", [([0.0, 0.0, 0.2], "z"), ([0.0, 0.2, 0.0], "y")])
+def test_joint_rotation_is_opt_in(mocker: MockerFixture, angular, axis) -> None:
+    task, solver = _task(mocker)
+    task.on_ee_twist_command(TwistStamped(angular=angular), t_now=1.0)
+
+    task.compute(_state(1.1, dt=0.1))
+
+    assert "joint_velocities" not in solver.step.call_args.kwargs
+    target = solver.step.call_args.args[0]["tool"]
+    assert target.orientation.to_rotation_matrix() == pytest.approx(
+        Rotation.from_euler(axis, 0.02).as_matrix()
+    )
+
+
+@pytest.mark.parametrize("field", ["base_rotation_joint", "pitch_rotation_joint"])
+def test_joint_rotation_requires_a_controlled_joint(mocker: MockerFixture, field) -> None:
+    with pytest.raises(ValueError, match=field):
+        _task(mocker, **{field: "other/joint"})
+
+
+@pytest.mark.parametrize(
+    "linear,angular", [([0.1, 0.0, 0.0], [0.0, 0.0, 0.2]), ([0.0, 0.0, 0.0], [0.0, 0.2, 0.2])]
+)
+def test_mixed_twist_keeps_cartesian_control(
+    mocker: MockerFixture, linear: list[float], angular: list[float]
+) -> None:
+    task, solver = _task(
+        mocker, base_rotation_joint="arm/joint1", pitch_rotation_joint="arm/joint2"
+    )
+    task.on_ee_twist_command(TwistStamped(linear=linear, angular=angular), t_now=1.0)
+
+    assert task.compute(_state(1.01)) is not None
+
+    assert "joint_velocities" not in solver.step.call_args.kwargs
+
+
+def test_switching_between_cartesian_and_base_reanchors_controller(
+    mocker: MockerFixture,
+) -> None:
+    task, solver = _task(mocker, base_rotation_joint="arm/joint1")
+    task.on_ee_twist_command(_twist(), t_now=1.0)
+    task.compute(_state(1.01))
+    resets = solver.reset.call_count
+    pose = PoseStamped(position=[0.3, 0.1, 0.2])
+    solver.frame_poses.return_value = {"tool": pose}
+
+    task.on_ee_twist_command(TwistStamped(angular=[0.0, 0.0, 0.2]), t_now=1.02)
+    assert task.compute(_state(1.03)) is not None
+
+    assert solver.reset.call_count == resets + 1
+    assert solver.step.call_args.kwargs["joint_velocities"] == {"arm/joint1": 0.2}
+    assert solver.step.call_args.args[0]["tool"].position.to_numpy() == pytest.approx(
+        pose.position.to_numpy()
+    )
+    task.on_ee_twist_command(_twist(), t_now=1.04)
+    assert task.compute(_state(1.05)) is not None
+
+    assert solver.reset.call_count == resets + 2
+    assert solver.frame_poses.call_count == 3
+    assert "joint_velocities" not in solver.step.call_args.kwargs
+    assert solver.step.call_args.args[0]["tool"].position.to_numpy() == pytest.approx(
+        [0.301, 0.1, 0.2]
+    )
+
+
+def test_switching_between_base_pitch_and_cartesian_discards_previous_motion(mocker):
+    task, solver = _task(
+        mocker, base_rotation_joint="arm/joint1", pitch_rotation_joint="arm/joint2"
+    )
+    task.on_ee_twist_command(TwistStamped(angular=[0, 0, 0.2]), t_now=1.0)
+    task.compute(_state(1.01))
+    resets = solver.reset.call_count
+
+    task.on_ee_twist_command(TwistStamped(angular=[0, -0.2, 0]), t_now=1.02)
+    assert task.compute(_state(1.03)) is not None
+    assert solver.step.call_args.kwargs["joint_velocities"] == {"arm/joint2": -0.2}
+    assert solver.reset.call_count == resets + 1
+
+    task.on_ee_twist_command(TwistStamped(angular=[0, 0, -0.2]), t_now=1.04)
+    assert task.compute(_state(1.05)) is not None
+    assert solver.step.call_args.kwargs["joint_velocities"] == {"arm/joint1": -0.2}
+    assert solver.reset.call_count == resets + 2
+
+    task.on_ee_twist_command(_twist(), t_now=1.06)
+    assert task.compute(_state(1.07)) is not None
+    assert "joint_velocities" not in solver.step.call_args.kwargs
+    assert solver.reset.call_count == resets + 3
+    assert solver.frame_poses.call_count == 4
+
+
+@pytest.fixture(
+    params=[
+        ("base_rotation_joint", "arm/joint1", [0.0, 0.0, 0.2]),
+        ("pitch_rotation_joint", "arm/joint2", [0.0, 0.2, 0.0]),
+    ]
+)
+def joint_rotation(request):
+    return request.param
+
+
+def test_centering_joint_rotation_holds_without_ik_then_releases_joints(
+    mocker: MockerFixture, joint_rotation
+) -> None:
+    field, joint, angular = joint_rotation
+    task, solver = _task(mocker, **{field: joint})
+    task.on_ee_twist_command(TwistStamped(angular=angular), t_now=1.0)
+    task.compute(_state(1.01))
+    resets = solver.reset.call_count
+
+    task.on_ee_twist_command(TwistStamped(), t_now=1.21)
+    assert task.compute(_state(1.22)) is not None
+
+    assert solver.reset.call_count == resets + 1
+    assert solver.step.call_args.kwargs["joint_velocities"] == {joint: 0.0}
+    assert task.compute(_state(1.4)) is not None
+    assert solver.step.call_args.kwargs["joint_velocities"] == {joint: 0.0}
+    assert not task.is_active()
+    calls = solver.step.call_count
+    assert task.compute(_state(1.41)) is None
+    assert solver.step.call_count == calls
+
+
+def test_joint_rotation_timeout_stops_without_ik(mocker: MockerFixture, joint_rotation) -> None:
+    field, joint, angular = joint_rotation
+    task, solver = _task(mocker, **{field: joint})
+    task.on_ee_twist_command(TwistStamped(angular=angular), t_now=1.0)
+    task.compute(_state(1.01))
+    resets = solver.reset.call_count
+
+    assert task.compute(_state(1.31)) is not None
+
+    assert solver.reset.call_count == resets + 1
+    assert solver.step.call_args.kwargs["joint_velocities"] == {joint: 0.0}
+    assert not task.is_active()
+    task.on_ee_twist_command(TwistStamped(angular=[-value for value in angular]), t_now=2.0)
+    assert task.compute(_state(2.01)) is not None
+    assert solver.reset.call_count == resets + 2
+    assert solver.step.call_args.kwargs["joint_velocities"] == {joint: -0.2}
+
+
+def test_joint_rotation_estop_clears_motion_and_preserves_direct_hold(
+    mocker: MockerFixture, joint_rotation
+) -> None:
+    field, joint, angular = joint_rotation
+    task, solver = _task(mocker, **{field: joint})
+    twist = TwistStamped(angular=angular)
+    task.on_ee_twist_command(twist, t_now=1.0)
+    task.compute(_state(1.01))
+
+    task.set_estop(True)
+    assert not task.on_ee_twist_command(twist, t_now=1.02)
+    assert task.compute(_state(1.02)) is None
+
+    task.set_estop(False)
+    assert task.compute(_state(1.03)) is not None
+    assert solver.step.call_args.kwargs["joint_velocities"] == {joint: 0.0}
+    assert solver.frame_poses.call_count == 2

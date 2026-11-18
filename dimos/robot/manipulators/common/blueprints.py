@@ -60,11 +60,11 @@ def trajectory_task(
 
 
 def _model_joint_names(
-    hardware: HardwareComponent,
+    hardware: HardwareComponent | None,
     robot_model: RobotModelConfig,
 ) -> list[str]:
     joint_names = list(robot_model.joint_names)
-    if not set(joint_names) <= set(hardware.joints):
+    if hardware is not None and not set(joint_names) <= set(hardware.joints):
         raise ValueError("hardware joints must contain RobotModelConfig joints")
     return joint_names
 
@@ -87,7 +87,7 @@ def cartesian_ik_task(
 
 
 def eef_twist_task(
-    hardware: HardwareComponent,
+    hardware: HardwareComponent | None = None,
     *,
     robot_model: RobotModelConfig,
     target_frame: str,
@@ -97,6 +97,8 @@ def eef_twist_task(
     max_joint_velocity_rad_s: float = 5.0,
     max_command_tracking_error_deg: float = 10.0,
     pink: PinkKinematicsConfig | None = None,
+    base_rotation_joint: str | None = None,
+    pitch_rotation_joint: str | None = None,
 ) -> TaskConfig:
     task_params: dict[str, Any] = {
         "robot_model": robot_model,
@@ -104,6 +106,8 @@ def eef_twist_task(
         "timeout": timeout,
         "max_joint_velocity_rad_s": max_joint_velocity_rad_s,
         "max_command_tracking_error_deg": max_command_tracking_error_deg,
+        "base_rotation_joint": base_rotation_joint,
+        "pitch_rotation_joint": pitch_rotation_joint,
     }
     if pink is not None:
         task_params["pink"] = pink

@@ -296,6 +296,8 @@ control = [
     "xacro",
 ]
 
+spacemouse = ["pyspacemouse==2.1.0"]
+
 # Motion planning and its interactive visualization, without perception or agents.
 planning = [
     "dimos[control]",
